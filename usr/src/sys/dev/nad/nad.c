@@ -51,6 +51,7 @@ SOFTWARE.
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include <geom/geom.h>
 #include <geom/geom_int.h>
@@ -124,7 +125,7 @@ struct nad_softc {
     unsigned flags;
     char name[64];
     struct proc *gio_proc;
-    struct proc *conn_proc;
+    struct proc *net_proc;
     struct g_geom *gp;
     struct g_provider *pp;
     struct socket *nad_so;
@@ -134,9 +135,22 @@ struct nad_softc {
     int port;
     int opencount;
     int is_connected;
+    int is_sending;
+    int is_receiving;
     int shutdown;
     int disconnect;
 };
+
+static struct nad_softc* nadfind(int unit);
+static struct nad_softc* nadnew(int unit, off_t mediasize, int port, int *errp); 
+static void nadnewprovider(struct nad_softc *sc); 
+static int naddestroy(struct nad_softc *sc, struct thread *td); 
+static void nadgiothread(void *arg); 
+static int naddoio(struct nad_softc *sc, struct bio *bp); 
+static void nad_network_thread(void *arg);
+static int nad_connect_socket(struct nad_softc *sc);
+static void nad_close_socket(struct nad_softc *sc);
+
 
 static void 
 nad_close_socket(struct nad_softc *sc) {
@@ -165,10 +179,9 @@ nad_close_socket(struct nad_softc *sc) {
     }
 }
 
-static int
-nad_conn_thread(void *arg) {
+static void
+nad_network_thread(void *arg) {
     struct nad_softc *sc = arg;
-    int error = 0;
 
     while(1) {
         if(sc->shutdown)
@@ -180,7 +193,7 @@ nad_conn_thread(void *arg) {
         }
 
         if(sc->nad_so == NULL) {
-            nad_connect(sc);
+            nad_connect_socket(sc);
         }
 
         if(sc->nad_so != NULL) {
@@ -313,7 +326,8 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
     sc->port = port;
     sc->opencount = 0;
     sc->mediasize = mediasize;
-    sc->is_connected = 0;
+    sc->is_sending = 0;
+    sc->is_receiving = 0;
     sc->shutdown = 0;
     sc->disconnect = 0;
     sc->is_connected = 0;
@@ -440,7 +454,7 @@ xnadctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct threa
 
             sc->sectorsize = nadio->nad_sectorsize;
             sc->start = naddoio;
-            error = kproc_create(nad_conn_thread, sc, &sc->conn_proc, 
+            error = kproc_create(nad_network_thread, sc, &sc->net_proc, 
                     0, 0, "%s", sc->name);
             if (error != 0) {
                 printf("error creating CTL NAD connection thread for nad%d!\n",
@@ -487,11 +501,11 @@ nad_setup_socket(struct nad_softc *sc) {
 
 	SOCKBUF_LOCK(&so->so_rcv);
 	so->so_rcv.sb_lowat = sizeof(struct nad_wire_msg);
-	soupcall_set(so, SO_RCV, ctl_ha_rupcall, sc);
+	soupcall_set(so, SO_RCV, nad_rupcall, sc);
 	SOCKBUF_UNLOCK(&so->so_rcv);
 	SOCKBUF_LOCK(&so->so_snd);
 	so->so_snd.sb_lowat = sizeof(struct nad_wire_msg);
-	soupcall_set(so, SO_SND, ctl_ha_supcall, sc);
+	soupcall_set(so, SO_SND, nad_supcall, sc);
 	SOCKBUF_UNLOCK(&so->so_snd);
 
 	bzero(&opt, sizeof(struct sockopt));
@@ -501,7 +515,7 @@ nad_setup_socket(struct nad_softc *sc) {
 	opt.sopt_val = &val;
 	opt.sopt_valsize = sizeof(val);
 	val = 1;
-	error = sosetopt(so, &opt);
+	err = sosetopt(so, &opt);
 	if (err)
 		printf("%s: KEEPALIVE setting failed %d\n", __func__, err);
 
@@ -538,7 +552,7 @@ nad_setup_socket(struct nad_softc *sc) {
 }
 
 static int
-nad_connect(struct nad_softc *sc) {
+nad_connect_socket(struct nad_softc *sc) {
 	struct thread *td = curthread;
 	struct sockaddr_in sa;
 	struct socket *so;
@@ -553,13 +567,13 @@ nad_connect(struct nad_softc *sc) {
 	}
 
 	sc->nad_so = so;
-    nad_setup_socket(softc);
-    memset(sa, 0, sizeof(*sa));
-    sa->sin_len = sizeof(struct sockaddr_in);
-    sa->sin_family = AF_INET;
-    sa->sin_port = htons(sc->port);
-    sa->sin_addr.s_addr = htonl((127 << 24) + (0 << 16) + (0 << 8) + 1);
-    error = soconnect(so, (struct sockkaddr *)&sa, td);
+    nad_setup_socket(sc);
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_len = sizeof(struct sockaddr_in);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(sc->port);
+    sa.sin_addr.s_addr = htonl((127 << 24) + (0 << 16) + (0 << 8) + 1);
+    error = soconnect(so, (struct sockaddr *)&sa, td);
     if(error) {
 		printf("%s: soconnect() error %d\n", __func__, error);
         goto errout;
@@ -568,7 +582,7 @@ nad_connect(struct nad_softc *sc) {
     return(0);
 
 errout:
-    nad_close(softc);
+    nad_close_socket(sc);
     return(error);
 }
 
