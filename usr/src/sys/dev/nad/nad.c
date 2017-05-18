@@ -123,7 +123,8 @@ struct nad_softc {
     unsigned sectorsize;
     unsigned flags;
     char name[64];
-    struct proc *procp;
+    struct proc *gio_proc;
+    struct proc *conn_proc;
     struct g_geom *gp;
     struct g_provider *pp;
     struct socket *nad_so;
@@ -132,11 +133,64 @@ struct nad_softc {
     struct vdisk_buffer *vdisk;
     int port;
     int opencount;
+    int is_connected;
+    int shutdown;
+    int disconnect;
 };
 
-static int
-nad_conn_handler() {
+static void 
+nad_close_socket(struct nad_softc *sc) {
+    if(sc->is_connected || sc->disconnect) {
+        sc->is_connected = 0;
+        sc->flags |= NAD_SHUTDOWN;
+        //do some cleanup here
+    }
 
+    struct socket *so = sc->nad_so;
+    if(so != NULL) {
+        SOCKBUF_LOCK(&so->so_rcv);
+		soupcall_clear(so, SO_RCV);
+		while (sc->is_receiving) {
+			wakeup(&sc->is_receiving);
+			msleep(&sc->is_receiving, SOCKBUF_MTX(&so->so_rcv),
+			    0, "nad exit", 0);
+		}
+		SOCKBUF_UNLOCK(&so->so_rcv);
+		SOCKBUF_LOCK(&so->so_snd);
+		soupcall_clear(so, SO_SND);
+		SOCKBUF_UNLOCK(&so->so_snd);
+		sc->nad_so = NULL;
+		soclose(so);       
+        sc->shutdown = 1;
+    }
+}
+
+static int
+nad_conn_thread(void *arg) {
+    struct nad_softc *sc = arg;
+    int error = 0;
+
+    while(1) {
+        if(sc->shutdown)
+            break;
+
+        if(sc->disconnect) {
+            nad_close_socket(sc);
+            sc->disconnect = 0; 
+        }
+
+        if(sc->nad_so == NULL) {
+            nad_connect(sc);
+        }
+
+        if(sc->nad_so != NULL) {
+            if(sc->is_connected == 0 && sc->nad_so->so_error == 0 &&
+                    (sc->nad_so->so_state & SS_ISCONNECTING) == 0) {
+                sc->is_connected = 1;
+                nadnewprovider(sc);
+            }
+        }
+    }
 }
 
 static int 
@@ -192,7 +246,7 @@ naddoio(struct nad_softc *sc, struct bio *bp) {
 }
 
 static void 
-nadthread(void *arg) {
+nadgiothread(void *arg) {
     struct nad_softc *sc;
     struct bio *bp;
     int error = 0;
@@ -250,7 +304,6 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
 
     sc = (struct nad_softc *)malloc(sizeof *sc, M_NAD, M_WAITOK | M_ZERO);
     sc->vdisk = (struct vdisk_buffer*)malloc(sizeof(struct vdisk_buffer), M_NAD, M_WAITOK | M_ZERO);
-    printf("malloc media\n");
     sc->vdisk->buffer = malloc(mediasize*sizeof(char), M_NAD, M_WAITOK | M_ZERO);
     mtx_init(&sc->vdisk->m, "nad vdisk buffer", NULL, MTX_DEF);
     bioq_init(&sc->bio_queue);
@@ -260,6 +313,10 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
     sc->port = port;
     sc->opencount = 0;
     sc->mediasize = mediasize;
+    sc->is_connected = 0;
+    sc->shutdown = 0;
+    sc->disconnect = 0;
+    sc->is_connected = 0;
     if(unit < 10) {
         sprintf(sc->name, "nad00%d", unit);
     } else if(unit < 100) {
@@ -268,7 +325,7 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
         sprintf(sc->name, "nad%d", unit);
     }
     LIST_INSERT_HEAD(&nad_softc_list, sc, list);
-    error = kproc_create(nadthread, sc, &sc->procp, 0, 0, "%s", sc->name);
+    error = kproc_create(nadgiothread, sc, &sc->gio_proc, 0, 0, "%s", sc->name);
     if(error == 0) {
         return(sc);
     }
@@ -344,7 +401,7 @@ naddestroy(struct nad_softc *sc, struct thread *td) {
     sc->flags |= NAD_SHUTDOWN;
     wakeup(sc);
     while(!(sc->flags & NAD_EXITING)) {
-        msleep(sc->procp, &sc->queue_mtx, PRIBIO, "naddestroy", hz/10);
+        msleep(sc->gio_proc, &sc->queue_mtx, PRIBIO, "naddestroy", hz/10);
     }
 
     mtx_unlock(&sc->queue_mtx);
@@ -383,7 +440,15 @@ xnadctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct threa
 
             sc->sectorsize = nadio->nad_sectorsize;
             sc->start = naddoio;
-            nadnewprovider(sc);
+            error = kproc_create(nad_conn_thread, sc, &sc->conn_proc, 
+                    0, 0, "%s", sc->name);
+            if (error != 0) {
+                printf("error creating CTL NAD connection thread for nad%d!\n",
+                        sc->unit);
+                naddestroy(sc, td);
+                return(error);
+            }
+            //call on successful connect!
             return(0);
         case NADIOCDETACH:
             sc = nadfind(nadio->nad_unit);
@@ -391,6 +456,7 @@ xnadctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct threa
                 return(ENOENT);
             if(sc->opencount != 0)
                 return(EBUSY);
+            //XXX change this, not corrct yet
             return(naddestroy(sc, td));
         default:
             return(ENOIOCTL);
