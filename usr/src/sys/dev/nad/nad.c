@@ -71,6 +71,51 @@ static int nad_debug;
 SYSCTL_INT(_debug, OID_AUTO, naddebug, CTLFLAG_RW, &nad_debug, 0,
         "Enable nad debug messages");
 
+/*
+    To use this module you need to run nadserver in order to offer
+    a network attached disk to nadservice. nadserver is running remotely
+    on freebsd, linux or windows. nadservice is running locally. This module
+    will connect to nadservice for each attached network disk and nadservice
+    (running in userlandi) will communicate via rpc with nadserver.
+    Each disk has a designated port configured and reported by nadservice and
+    nadserver. nadconfig attaches and sets up the pre-configured network 
+    attached disk and makes it available as a normal device.
+
+    g_nad_init is the entry point when geom_nad.ko is loaded.
+    It creates a geom class called nad and sets up a device /dev/nadctl.
+    Using ioctl structures you create network attached disk devices.
+    These devices are nad providers. g_nad_start, g_nad_access and
+    g_nad_dumpconf get called when io goes to one of these devices.
+
+    g_nad_fini is the exit point when geom_nad.ko is unloaded.
+    It destroys the control device /dev/nadctl.
+
+    nadctlioctl is bound to the control device /dev/nadctl
+    and forwards the job to be done to xnadctlioctl. It acquires a config
+    lock before it forwards the nad_cmd request.
+
+    NADIOCATTACH
+
+    This command will create a network attached disk (a new geom_nad provider).
+    It uses nad_unit, nad_sectorsize and nad_mediasize to create a new virtual
+    disk bound to /dev/nad{nad_unit}.
+
+    It calls nadnew. nadnew allocates and initializes a nad_softc structure.
+    It creates a thread nadgiothread. This thread deals with bio structs put
+    into bio_queue for this device by g_nad_start and calls naddoio to handle
+    the data. Furthermore it creates nad_network_thread. This thread sets up the
+    socket and connection to nadservice by calling nad_connect_socket and 
+    nad_configure_socket. nad_configure_socket  configures the socket options 
+    and sets up upcalls for sends and receives in case the low water marks are 
+    reached to wakeup threads waiting to send or receive bio buffers. Then this 
+    thread creates the new provider and device on success.
+    
+    It would be awesome to use mmap in nadservice to avoid the local network
+    stuff, unfortunately I don't know how yet and I want to see it working.
+    It is a nice exercise to do network programming in kernel space and gives
+    some interesting insights useful for userland network programming.
+*/
+
 static g_init_t g_nad_init;
 static g_fini_t g_nad_fini;
 static g_start_t g_nad_start;
@@ -91,6 +136,7 @@ struct vdisk_buffer {
 struct nad_wire_msg {
     off_t offset;
     uint64_t length;
+    int rc;
 };
 
 static struct cdevsw nadctl_cdevsw = {
@@ -137,10 +183,16 @@ struct nad_softc {
     int is_connected;
     int is_sending;
     int is_receiving;
+    int can_rx;
+    int can_sx;
     int shutdown;
     int disconnect;
 };
 
+static int nad_rupcall(struct socket *so, void *arg, int waitflag);
+static int nad_supcall(struct socket *so, void *arg, int waitflag);
+static void nad_rx_thread(void *arg);
+static void nad_sx_thread(void *arg);
 static struct nad_softc* nadfind(int unit);
 static struct nad_softc* nadnew(int unit, off_t mediasize, int port, int *errp); 
 static void nadnewprovider(struct nad_softc *sc); 
@@ -151,6 +203,21 @@ static void nad_network_thread(void *arg);
 static int nad_connect_socket(struct nad_softc *sc);
 static void nad_close_socket(struct nad_softc *sc);
 
+/* If the low water mark is reached wakeup threads waiting to receive data */
+static int 
+nad_rupcall(struct socket *so, void *arg, int waitflag) {
+    struct nad_softc *sc = arg;
+    wakeup(&sc->can_rx);
+    return(SU_OK);
+}
+
+/* If the low water mark is reached wakeup threads waiting to send data */
+static int 
+nad_supcall(struct socket *so, void *arg, int waitflag) {
+    struct nad_softc *sc = arg;
+    wakeup(&sc->can_sx);
+    return(SU_OK);
+}
 
 static void 
 nad_close_socket(struct nad_softc *sc) {
@@ -183,6 +250,7 @@ static void
 nad_network_thread(void *arg) {
     struct nad_softc *sc = arg;
 
+    /*XXX Something is missing here to avoid busy spinning */
     while(1) {
         if(sc->shutdown)
             break;
@@ -339,6 +407,7 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
         sprintf(sc->name, "nad%d", unit);
     }
     LIST_INSERT_HEAD(&nad_softc_list, sc, list);
+    sc->start = naddoio;
     error = kproc_create(nadgiothread, sc, &sc->gio_proc, 0, 0, "%s", sc->name);
     if(error == 0) {
         return(sc);
@@ -453,7 +522,6 @@ xnadctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct threa
                 return(error);
 
             sc->sectorsize = nadio->nad_sectorsize;
-            sc->start = naddoio;
             error = kproc_create(nad_network_thread, sc, &sc->net_proc, 
                     0, 0, "%s", sc->name);
             if (error != 0) {
@@ -484,6 +552,81 @@ nadctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct thread
     error = xnadctlioctl(dev, cmd, addr, flags, td);
     sx_xunlock(&nad_sx);
     return(error);
+}
+
+static void
+nad_rx_thread(void *arg) {
+    struct nad_softc *sc = arg;
+    struct socket *so = sc->nad_so;
+    struct nad_wire_msg ctl_hdr;
+	struct uio uio;
+	struct iovec iov;
+    int next, error, flags;
+
+    bzero(&ctl_hdr, sizeof(ctl_hdr));
+
+    while(1) {
+        if(ctl_hdr.length > 0) {
+            next = ctl_hdr.length;
+        } else {
+            next = sizeof(ctl_hdr);
+        }
+
+        SOCKBUF_LOCK(&so->so_rcv);
+        /*
+           XXX should be if and msleep on can_rx otherwise 
+           need to distinguish between ctl_hdr and data
+         */
+		while (sbavail(&so->so_rcv) < next || sc->disconnect) {
+			if (sc->is_connected == 0 || sc->disconnect ||
+			    so->so_error ||
+			    (so->so_rcv.sb_state & SBS_CANTRCVMORE)) {
+				goto errout;
+			}
+			so->so_rcv.sb_lowat = next;
+			msleep(&sc->can_rx, SOCKBUF_MTX(&so->so_rcv),
+			    0, "-", 0);
+		}
+        SOCKBUF_UNLOCK(&so->so_rcv);
+
+		if (ctl_hdr.length == 0) {
+			iov.iov_base = &ctl_hdr;
+			iov.iov_len = sizeof(ctl_hdr);
+			uio.uio_iov = &iov;
+			uio.uio_iovcnt = 1;
+			uio.uio_rw = UIO_READ;
+			uio.uio_segflg = UIO_SYSSPACE;
+			uio.uio_td = curthread;
+			uio.uio_resid = sizeof(ctl_hdr);
+			flags = MSG_DONTWAIT;
+			error = soreceive(so, NULL, &uio, NULL,
+			    NULL, &flags);
+			if (error != 0) {
+				printf("%s: ctl_hdr receive error %d\n",
+				    __func__, error);
+				SOCKBUF_LOCK(&so->so_rcv);
+				goto errout;
+			}
+		} else {
+            /*
+			ctl_nad_evt(sc, ctl_hdr.channel,
+			    CTL_NAD_EVT_MSG_RECV, ctl_hdr.length);
+			ctl_hdr.length = 0;
+            */
+		}
+    }
+
+errout:
+	sc->can_rx = 0;
+	wakeup(&sc->can_rx);
+	SOCKBUF_UNLOCK(&so->so_rcv);
+	//ctl_ha_conn_wake(softc);
+	kthread_exit();
+}
+
+static void
+nad_sx_thread(void *arg) {
+
 }
 
 //add options to ioctl
@@ -588,11 +731,18 @@ errout:
 
 static void 
 g_nad_init(struct g_class *mp __unused) {
+    if(nad_debug) {
+        printf("%s called\n", __func__);
+    }
     sx_init(&nad_sx, "NAD config lock");
     g_topology_unlock();
     status_dev = make_dev(&nadctl_cdevsw, INT_MAX, UID_ROOT, GID_WHEEL, 0600,
             NADCTL_NAME);
     g_topology_lock();
+
+    if(nad_debug) {
+        printf("%s %s created\n", __func__, NADCTL_NAME);
+    }
 }
 
 static void 
