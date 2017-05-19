@@ -127,12 +127,6 @@ static struct sx nad_sx;
 static struct cdev *status_dev = 0;
 static d_ioctl_t nadctlioctl;
 
-//just for testing - will be removed as soon as networking works
-struct vdisk_buffer {
-    char *buffer;
-    struct mtx m;
-};
-
 struct nad_wire_msg {
     off_t offset;
     uint64_t length;
@@ -177,7 +171,6 @@ struct nad_softc {
     struct socket *nad_so;
     int (*start)(struct nad_softc *sc, struct bio *bp);
     struct devstat *devstat;
-    struct vdisk_buffer *vdisk;
     int port;
     int opencount;
     int is_connected;
@@ -283,9 +276,12 @@ naddoio(struct nad_softc *sc, struct bio *bp) {
 	switch (bp->bio_cmd) {
         case BIO_READ:
             if((bp->bio_offset+bp->bio_bcount) < sc->mediasize) {
+            /*
+                read from network instead from memory disk
                 mtx_lock(&sc->vdisk->m);
                 memcpy(buf, sc->vdisk->buffer+bp->bio_offset, bp->bio_bcount);
                 mtx_unlock(&sc->vdisk->m);
+           */
             } else {
                 berr = EIO;
                 goto errout;
@@ -293,9 +289,12 @@ naddoio(struct nad_softc *sc, struct bio *bp) {
             break;
         case BIO_WRITE:
             if((bp->bio_offset+bp->bio_bcount) <= sc->mediasize) {
+            /*
+                Write to network instead of memory disk
                 mtx_lock(&sc->vdisk->m);
                 memcpy(sc->vdisk->buffer+bp->bio_offset, buf, bp->bio_bcount);
                 mtx_unlock(&sc->vdisk->m);
+            */
             } else {
                 berr = EIO;
                 goto errout;
@@ -303,9 +302,12 @@ naddoio(struct nad_softc *sc, struct bio *bp) {
             break;
 	case BIO_DELETE:
         if((bp->bio_offset+bp->bio_bcount) <= sc->mediasize) {
+        /* 
+           send request to zero out things via network
             mtx_lock(&sc->vdisk->m);
             memset(sc->vdisk->buffer+bp->bio_offset, 0, bp->bio_bcount);
             mtx_unlock(&sc->vdisk->m);
+        */
         } else {
             berr = EIO;
             goto errout;
@@ -384,9 +386,6 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
     }
 
     sc = (struct nad_softc *)malloc(sizeof *sc, M_NAD, M_WAITOK | M_ZERO);
-    sc->vdisk = (struct vdisk_buffer*)malloc(sizeof(struct vdisk_buffer), M_NAD, M_WAITOK | M_ZERO);
-    sc->vdisk->buffer = malloc(mediasize*sizeof(char), M_NAD, M_WAITOK | M_ZERO);
-    mtx_init(&sc->vdisk->m, "nad vdisk buffer", NULL, MTX_DEF);
     bioq_init(&sc->bio_queue);
     mtx_init(&sc->queue_mtx, "nad bio queue", NULL, MTX_DEF);
     mtx_init(&sc->stat_mtx, "nad stat", NULL, MTX_DEF);
@@ -414,11 +413,8 @@ nadnew(int unit, off_t mediasize, int port, int *errp) {
     }
 
     LIST_REMOVE(sc, list);
-    mtx_destroy(&sc->vdisk->m);
     mtx_destroy(&sc->stat_mtx);
     mtx_destroy(&sc->queue_mtx);
-    free(sc->vdisk->buffer, M_NAD);
-    free(sc->vdisk, M_NAD);
     free(sc, M_NAD);
     *errp = error;
     return(NULL);
@@ -488,12 +484,9 @@ naddestroy(struct nad_softc *sc, struct thread *td) {
     }
 
     mtx_unlock(&sc->queue_mtx);
-    mtx_destroy(&sc->vdisk->m);
     mtx_destroy(&sc->stat_mtx);
     mtx_destroy(&sc->queue_mtx);
     LIST_REMOVE(sc, list);
-    free(sc->vdisk->buffer, M_NAD);
-    free(sc->vdisk, M_NAD);
     free(sc, M_NAD);
     return(0);
 }
