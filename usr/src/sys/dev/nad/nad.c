@@ -182,6 +182,7 @@ struct nad_softc {
     int disconnect;
 };
 
+static void nad_setup_socket(struct nad_softc *sc, int *error);
 static int nad_rupcall(struct socket *so, void *arg, int waitflag);
 static int nad_supcall(struct socket *so, void *arg, int waitflag);
 static void nad_rx_thread(void *arg);
@@ -233,8 +234,8 @@ nad_close_socket(struct nad_softc *sc) {
 		SOCKBUF_LOCK(&so->so_snd);
 		soupcall_clear(so, SO_SND);
 		SOCKBUF_UNLOCK(&so->so_snd);
-		sc->nad_so = NULL;
 		soclose(so);       
+		sc->nad_so = NULL;
         sc->shutdown = 1;
     }
 }
@@ -518,7 +519,7 @@ xnadctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct threa
             error = kproc_create(nad_network_thread, sc, &sc->net_proc, 
                     0, 0, "%s", sc->name);
             if (error != 0) {
-                printf("error creating CTL NAD connection thread for nad%d!\n",
+                printf("error creating nad network thread for nad%d!\n",
                         sc->unit);
                 naddestroy(sc, td);
                 return(error);
@@ -624,7 +625,7 @@ nad_sx_thread(void *arg) {
 
 //add options to ioctl
 static void 
-nad_setup_socket(struct nad_softc *sc) {
+nad_setup_socket(struct nad_softc *sc, int *error) {
     struct sockopt opt;
     struct socket *so = sc->nad_so;
     int err, val;
@@ -633,6 +634,8 @@ nad_setup_socket(struct nad_softc *sc) {
     err = soreserve(so, val, val);
     if(err) {
        printf("%s: soreserve failed %d\n", __func__, err);
+       *error = err;
+       return;
     } 
 
 	SOCKBUF_LOCK(&so->so_rcv);
@@ -652,39 +655,57 @@ nad_setup_socket(struct nad_softc *sc) {
 	opt.sopt_valsize = sizeof(val);
 	val = 1;
 	err = sosetopt(so, &opt);
-	if (err)
+	if(err) {
 		printf("%s: KEEPALIVE setting failed %d\n", __func__, err);
+        *error = err;
+        return;
+    }
 
 	opt.sopt_level = IPPROTO_TCP;
 	opt.sopt_name = TCP_NODELAY;
 	val = 1;
 	err = sosetopt(so, &opt);
-	if(err)
+	if(err) {
 		printf("%s: NODELAY setting failed %d\n", __func__, err);
+        *error = err;
+        return;
+    }
 
 	opt.sopt_name = TCP_KEEPINIT;
 	val = 3;
 	err = sosetopt(so, &opt);
-	if (err)
+	if(err) {
 		printf("%s: KEEPINIT setting failed %d\n", __func__, err);
+        *error = err;
+        return;
+    }
 
 	opt.sopt_name = TCP_KEEPIDLE;
 	val = 1;
 	err = sosetopt(so, &opt);
-	if (err)
+	if(err) {
 		printf("%s: KEEPIDLE setting failed %d\n", __func__, err);
+        *error = err;
+        return;
+    }
 
 	opt.sopt_name = TCP_KEEPINTVL;
 	val = 1;
 	err = sosetopt(so, &opt);
-	if (err)
+	if(err) {
 		printf("%s: KEEPINTVL setting failed %d\n", __func__, err);
+        *error = err;
+        return;
+    }
 
 	opt.sopt_name = TCP_KEEPCNT;
 	val = 5;
 	err = sosetopt(so, &opt);
-	if (err)
+	if(err) {
 		printf("%s: KEEPCNT setting failed %d\n", __func__, err);
+        *error = err;
+        return;
+    }
 }
 
 static int
@@ -703,7 +724,10 @@ nad_connect_socket(struct nad_softc *sc) {
 	}
 
 	sc->nad_so = so;
-    nad_setup_socket(sc);
+    nad_setup_socket(sc, &error);
+    if(error != 0) {
+        goto errout;
+    }
     memset(&sa, 0, sizeof(sa));
     sa.sin_len = sizeof(struct sockaddr_in);
     sa.sin_family = AF_INET;
